@@ -14,7 +14,18 @@ SpotifyFS turns Spotify playlist management into a local, inspectable, version-c
 ## Installation
 
 ```bash
-npm install -g spotifyfs
+# Clone the repository
+git clone https://github.com/cegersdoerfer/Spotify-chat.git
+cd Spotify-chat
+
+# Install dependencies
+npm install
+
+# Build the project
+npm run build
+
+# Link globally (optional, for using 'spotifyfs' command anywhere)
+npm link
 ```
 
 ## Prerequisites
