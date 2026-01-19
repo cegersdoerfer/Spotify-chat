@@ -9,7 +9,7 @@ SpotifyFS turns Spotify playlist management into a local, inspectable, version-c
 - **Local representation:** Playlists appear as folders; tracks appear as small reference files containing Spotify URIs
 - **Two-way sync:** Local edits update Spotify; Spotify edits update the local tree
 - **Git integration:** Changes are tracked in Git for version control and review
-- **Chatbot proposals:** AI-driven playlist creation as Git branches for review
+- **Chatbot proposals:** GPT-5 powered AI for intelligent playlist creation as Git branches for review
 
 ## Installation
 
@@ -21,10 +21,14 @@ npm install -g spotifyfs
 
 1. Create a Spotify app at https://developer.spotify.com/dashboard
 2. Set the redirect URI to `http://localhost:8888/callback`
-3. Set the `SPOTIFY_CLIENT_ID` environment variable
+3. Set the required environment variables:
 
 ```bash
-export SPOTIFY_CLIENT_ID=your_client_id
+# Required for Spotify integration
+export SPOTIFY_CLIENT_ID=your_spotify_client_id
+
+# Required for chatbot features (uses GPT-5)
+export OPENAI_API_KEY=your_openai_api_key
 ```
 
 ## Quick Start

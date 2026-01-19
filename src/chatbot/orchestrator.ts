@@ -61,8 +61,8 @@ export class ChatbotOrchestrator {
       // Step 1: Read existing playlists for context
       const existingPlaylists = this.serializer.readAllPlaylists();
 
-      // Step 2: Generate a plan
-      const { plan, confidence, interpretation } = this.planner.generatePlan(
+      // Step 2: Generate a plan using GPT-5
+      const { plan, confidence, interpretation } = await this.planner.generatePlan(
         prompt,
         existingPlaylists
       );

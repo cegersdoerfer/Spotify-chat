@@ -1,82 +1,186 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { ChatbotPlanner } from '../chatbot/planner.js';
 
+// Mock the OpenAI SDK
+vi.mock('openai', () => {
+  return {
+    default: vi.fn().mockImplementation(() => ({
+      chat: {
+        completions: {
+          create: vi.fn(),
+        },
+      },
+    })),
+  };
+});
+
 describe('ChatbotPlanner', () => {
-  const planner = new ChatbotPlanner();
+  let planner: ChatbotPlanner;
+  let mockCreate: ReturnType<typeof vi.fn>;
 
-  describe('analyzeIntent', () => {
-    it('should detect create playlist intent', () => {
-      const result = planner.analyzeIntent('Create a chill playlist');
-      expect(result.intent).toBe('create_playlist');
-      expect(result.confidence).toBeGreaterThan(0.7);
-    });
+  beforeEach(async () => {
+    // Reset mocks
+    vi.clearAllMocks();
 
-    it('should detect genre from prompt', () => {
-      const result = planner.analyzeIntent('Make a bossa nova playlist');
-      expect(result.entities.genre).toBe('bossa nova');
-    });
+    // Get the mocked OpenAI
+    const OpenAI = (await import('openai')).default;
+    planner = new ChatbotPlanner('test-api-key');
 
-    it('should detect use of saved tracks', () => {
-      const result = planner.analyzeIntent('Create a playlist from my saved songs');
-      expect(result.entities.useSavedTracks).toBe('true');
-    });
-
-    it('should detect add tracks intent', () => {
-      const result = planner.analyzeIntent('Add more jazz tracks to my playlist');
-      expect(result.intent).toBe('add_tracks');
-    });
-
-    it('should detect remove tracks intent', () => {
-      const result = planner.analyzeIntent('Remove all duplicate songs');
-      expect(result.intent).toBe('remove_tracks');
-    });
-
-    it('should detect target playlist', () => {
-      const result = planner.analyzeIntent('Add songs from my favorites playlist');
-      expect(result.entities.targetPlaylist).toBeDefined();
-    });
+    // Access the mock
+    mockCreate = (planner as unknown as { openai: { chat: { completions: { create: ReturnType<typeof vi.fn> } } } }).openai.chat.completions.create;
   });
 
   describe('generatePlan', () => {
-    it('should generate plan for creating playlist', () => {
-      const result = planner.generatePlan('Create a chill playlist', []);
+    it('should generate plan for creating a playlist', async () => {
+      const mockResponse = {
+        plan: {
+          intent: 'create_playlist',
+          steps: [
+            { type: 'create_branch', name: 'chill-vibes' },
+            { type: 'search_tracks', query: 'chill relaxing', limit: 100 },
+            { type: 'fetch_saved_tracks', limit: 200 },
+            { type: 'filter_tracks', criteria: { keywords: ['chill', 'relaxing', 'calm'] } },
+            { type: 'create_playlist', name: 'Chill Vibes' },
+            { type: 'commit_changes', message: 'Create playlist: Chill Vibes' },
+          ],
+          estimatedChanges: {
+            playlistsCreated: 1,
+            playlistsModified: 0,
+            tracksAdded: 50,
+            tracksRemoved: 0,
+          },
+        },
+        confidence: 0.95,
+        interpretation: 'Creating a new chill playlist with relaxing tracks from your library and Spotify search',
+      };
+
+      mockCreate.mockResolvedValue({
+        choices: [{ message: { content: JSON.stringify(mockResponse) } }],
+      });
+
+      const result = await planner.generatePlan('Create a chill playlist', []);
 
       expect(result.plan.intent).toBe('create_playlist');
       expect(result.plan.steps.length).toBeGreaterThan(0);
       expect(result.plan.steps.some((s) => s.type === 'create_playlist')).toBe(true);
       expect(result.plan.steps.some((s) => s.type === 'create_branch')).toBe(true);
+      expect(result.confidence).toBe(0.95);
     });
 
-    it('should include saved tracks step when requested', () => {
-      const result = planner.generatePlan('Create a playlist from my saved songs', []);
+    it('should call OpenAI with correct parameters', async () => {
+      const mockResponse = {
+        plan: {
+          intent: 'create_playlist',
+          steps: [
+            { type: 'create_branch', name: 'test' },
+            { type: 'create_playlist', name: 'Test' },
+            { type: 'commit_changes', message: 'Create playlist' },
+          ],
+          estimatedChanges: {
+            playlistsCreated: 1,
+            playlistsModified: 0,
+            tracksAdded: 0,
+            tracksRemoved: 0,
+          },
+        },
+        confidence: 0.9,
+        interpretation: 'Test',
+      };
 
-      expect(result.plan.steps.some((s) => s.type === 'fetch_saved_tracks')).toBe(true);
+      mockCreate.mockResolvedValue({
+        choices: [{ message: { content: JSON.stringify(mockResponse) } }],
+      });
+
+      await planner.generatePlan('Create a test playlist', []);
+
+      expect(mockCreate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          model: 'gpt-5',
+          messages: expect.arrayContaining([
+            expect.objectContaining({ role: 'system' }),
+            expect.objectContaining({ role: 'user', content: 'Create a test playlist' }),
+          ]),
+          response_format: { type: 'json_object' },
+        })
+      );
     });
 
-    it('should include search step for genre', () => {
-      const result = planner.generatePlan('Make a jazz playlist', []);
+    it('should include existing playlists in context', async () => {
+      const mockResponse = {
+        plan: {
+          intent: 'add_tracks',
+          steps: [
+            { type: 'create_branch', name: 'add-jazz' },
+            { type: 'fetch_playlist_tracks', playlistId: 'existing-123' },
+            { type: 'commit_changes', message: 'Add tracks' },
+          ],
+          estimatedChanges: {
+            playlistsCreated: 0,
+            playlistsModified: 1,
+            tracksAdded: 10,
+            tracksRemoved: 0,
+          },
+        },
+        confidence: 0.85,
+        interpretation: 'Adding jazz tracks to existing playlist',
+      };
 
-      const searchStep = result.plan.steps.find((s) => s.type === 'search_tracks');
-      expect(searchStep).toBeDefined();
+      mockCreate.mockResolvedValue({
+        choices: [{ message: { content: JSON.stringify(mockResponse) } }],
+      });
+
+      const existingPlaylists = [
+        {
+          playlistId: 'existing-123',
+          name: 'My Jazz Collection',
+          folderPath: '/path/to/jazz',
+          tracks: [],
+          metadata: {
+            id: 'existing-123',
+            uri: 'spotify:playlist:existing-123',
+            name: 'My Jazz Collection',
+            description: '',
+            isPublic: false,
+            collaborative: false,
+            snapshotId: 'snap1',
+            owner: { id: 'user1', displayName: 'User' },
+          },
+        },
+      ];
+
+      await planner.generatePlan('Add more jazz to my collection', existingPlaylists);
+
+      expect(mockCreate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          messages: expect.arrayContaining([
+            expect.objectContaining({
+              role: 'system',
+              content: expect.stringContaining('My Jazz Collection'),
+            }),
+          ]),
+        })
+      );
     });
 
-    it('should include filter step for genre', () => {
-      const result = planner.generatePlan('Create a rock playlist', []);
+    it('should return fallback plan when LLM fails', async () => {
+      mockCreate.mockRejectedValue(new Error('API Error'));
 
-      expect(result.plan.steps.some((s) => s.type === 'filter_tracks')).toBe(true);
+      const result = await planner.generatePlan('Create a playlist', []);
+
+      expect(result.confidence).toBe(0.3);
+      expect(result.interpretation).toContain('Fallback');
+      expect(result.plan.steps.some((s) => s.type === 'create_playlist')).toBe(true);
     });
 
-    it('should generate interpretation string', () => {
-      const result = planner.generatePlan('Create a bossa nova playlist from my saved tracks', []);
+    it('should return fallback plan when response is empty', async () => {
+      mockCreate.mockResolvedValue({
+        choices: [{ message: { content: null } }],
+      });
 
-      expect(result.interpretation).toContain('Creating');
-      expect(result.interpretation).toContain('bossa nova');
-    });
+      const result = await planner.generatePlan('Create a playlist', []);
 
-    it('should estimate changes', () => {
-      const result = planner.generatePlan('Create a new playlist', []);
-
-      expect(result.plan.estimatedChanges.playlistsCreated).toBe(1);
+      expect(result.confidence).toBe(0.3);
+      expect(result.interpretation).toContain('Fallback');
     });
   });
 
@@ -91,15 +195,10 @@ describe('ChatbotPlanner', () => {
       expect(queries).toContain('specific song');
     });
 
-    it('should extract genre keywords', () => {
-      const queries = planner.extractSearchQueries('get me some jazz tracks');
-      expect(queries.some((q) => q.includes('jazz'))).toBe(true);
-    });
-
     it('should deduplicate queries', () => {
-      const queries = planner.extractSearchQueries('jazz jazz jazz');
-      const jazzCount = queries.filter((q) => q === 'jazz').length;
-      expect(jazzCount).toBe(1);
+      const queries = planner.extractSearchQueries('"test" and "test" again');
+      const testCount = queries.filter((q) => q === 'test').length;
+      expect(testCount).toBe(1);
     });
   });
 });
