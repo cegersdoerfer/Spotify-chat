@@ -198,16 +198,30 @@ export interface ChatbotPlan {
 }
 
 export type PlanStep =
+  // Spotify API operations
   | { type: 'search_tracks'; query: string; limit: number }
   | { type: 'list_playlists' }
   | { type: 'fetch_playlist_tracks'; playlistId: string }
   | { type: 'fetch_saved_tracks'; limit: number }
   | { type: 'filter_tracks'; criteria: FilterCriteria }
-  | { type: 'create_playlist'; name: string }
+  // SQL operations (local database)
+  | { type: 'sql_query'; query: string; description: string }
+  | { type: 'sql_execute'; query: string; description: string }
+  // Playlist operations
+  | { type: 'create_playlist'; name: string; description?: string }
+  | { type: 'delete_playlist'; playlistId: string }
+  | { type: 'rename_playlist'; playlistId: string; newName: string }
+  // Track operations
   | { type: 'add_tracks_to_playlist'; playlistId: string; trackIds: string[] }
   | { type: 'remove_tracks_from_playlist'; playlistId: string; trackIds: string[] }
+  | { type: 'move_tracks'; fromPlaylistId: string; toPlaylistId: string; trackIds: string[] }
+  | { type: 'reorder_tracks'; playlistId: string; trackIds: string[] }
+  // Git operations
   | { type: 'create_branch'; name: string }
-  | { type: 'commit_changes'; message: string };
+  | { type: 'commit_changes'; message: string }
+  // Sync operations
+  | { type: 'sync_to_spotify' }
+  | { type: 'generate_markdown' };
 
 export interface FilterCriteria {
   genres?: string[];

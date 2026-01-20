@@ -1,33 +1,65 @@
-import Database from 'better-sqlite3';
+import initSqlJs, { Database as SqlJsDatabase } from 'sql.js';
 import { join } from 'path';
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import type {
   DbPlaylistMapping,
   DbSyncLog,
   DbProposal,
-  TokenData,
-  WorkspaceConfig,
-  ProposalMetadata,
 } from '../types/index.js';
 
 const SCHEMA_VERSION = 1;
 
+let SQL: Awaited<ReturnType<typeof initSqlJs>> | null = null;
+
+async function getSql(): Promise<typeof SQL> {
+  if (!SQL) {
+    SQL = await initSqlJs();
+  }
+  return SQL;
+}
+
 export class StateStore {
-  private db: Database.Database;
-  private workspacePath: string;
+  private db!: SqlJsDatabase;
+  private dbPath: string;
+  private initialized = false;
 
   constructor(workspacePath: string) {
-    this.workspacePath = workspacePath;
-    const dbPath = join(workspacePath, '.spotifyfs', 'state.db');
-    this.db = new Database(dbPath);
-    this.db.pragma('journal_mode = WAL');
+    const spotifyfsDir = join(workspacePath, '.spotifyfs');
+    if (!existsSync(spotifyfsDir)) {
+      mkdirSync(spotifyfsDir, { recursive: true });
+    }
+    this.dbPath = join(spotifyfsDir, 'state.db');
+  }
+
+  async init(): Promise<void> {
+    if (this.initialized) return;
+
+    const sql = await getSql();
+    if (!sql) throw new Error('Failed to initialize SQL.js');
+
+    // Load existing database or create new one
+    if (existsSync(this.dbPath)) {
+      const buffer = readFileSync(this.dbPath);
+      this.db = new sql.Database(buffer);
+    } else {
+      this.db = new sql.Database();
+    }
+
     this.initializeSchema();
+    this.initialized = true;
+  }
+
+  private save(): void {
+    const data = this.db.export();
+    const buffer = Buffer.from(data);
+    writeFileSync(this.dbPath, buffer);
   }
 
   private initializeSchema(): void {
     const version = this.getSchemaVersion();
 
     if (version < SCHEMA_VERSION) {
-      this.db.exec(`
+      this.db.run(`
         -- Schema version tracking
         CREATE TABLE IF NOT EXISTS schema_info (
           key TEXT PRIMARY KEY,
@@ -79,113 +111,99 @@ export class StateStore {
       `);
 
       this.setSchemaVersion(SCHEMA_VERSION);
+      this.save();
     }
   }
 
   private getSchemaVersion(): number {
     try {
-      const result = this.db
-        .prepare("SELECT value FROM schema_info WHERE key = 'version'")
-        .get() as { value: string } | undefined;
-      return result ? parseInt(result.value, 10) : 0;
+      const result = this.db.exec("SELECT value FROM schema_info WHERE key = 'version'");
+      if (result.length > 0 && result[0].values.length > 0) {
+        return parseInt(String(result[0].values[0][0]), 10);
+      }
+      return 0;
     } catch {
       return 0;
     }
   }
 
   private setSchemaVersion(version: number): void {
-    this.db
-      .prepare(
-        "INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', ?)"
-      )
-      .run(String(version));
+    this.db.run(
+      "INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', ?)",
+      [String(version)]
+    );
   }
 
   // Playlist mappings
   getPlaylistMapping(playlistId: string): DbPlaylistMapping | null {
-    const row = this.db
-      .prepare('SELECT * FROM playlist_mappings WHERE playlist_id = ?')
-      .get(playlistId) as {
-        playlist_id: string;
-        local_path: string;
-        snapshot_id: string;
-        last_synced_at: string;
-        track_hash: string;
-      } | undefined;
+    const result = this.db.exec(
+      'SELECT * FROM playlist_mappings WHERE playlist_id = ?',
+      [playlistId]
+    );
 
-    if (!row) return null;
+    if (result.length === 0 || result[0].values.length === 0) return null;
 
+    const row = result[0].values[0];
     return {
-      playlistId: row.playlist_id,
-      localPath: row.local_path,
-      snapshotId: row.snapshot_id,
-      lastSyncedAt: row.last_synced_at,
-      trackHash: row.track_hash,
+      playlistId: String(row[0]),
+      localPath: String(row[1]),
+      snapshotId: String(row[2]),
+      lastSyncedAt: String(row[3]),
+      trackHash: String(row[4]),
     };
   }
 
   getPlaylistMappingByPath(localPath: string): DbPlaylistMapping | null {
-    const row = this.db
-      .prepare('SELECT * FROM playlist_mappings WHERE local_path = ?')
-      .get(localPath) as {
-        playlist_id: string;
-        local_path: string;
-        snapshot_id: string;
-        last_synced_at: string;
-        track_hash: string;
-      } | undefined;
+    const result = this.db.exec(
+      'SELECT * FROM playlist_mappings WHERE local_path = ?',
+      [localPath]
+    );
 
-    if (!row) return null;
+    if (result.length === 0 || result[0].values.length === 0) return null;
 
+    const row = result[0].values[0];
     return {
-      playlistId: row.playlist_id,
-      localPath: row.local_path,
-      snapshotId: row.snapshot_id,
-      lastSyncedAt: row.last_synced_at,
-      trackHash: row.track_hash,
+      playlistId: String(row[0]),
+      localPath: String(row[1]),
+      snapshotId: String(row[2]),
+      lastSyncedAt: String(row[3]),
+      trackHash: String(row[4]),
     };
   }
 
   getAllPlaylistMappings(): DbPlaylistMapping[] {
-    const rows = this.db
-      .prepare('SELECT * FROM playlist_mappings')
-      .all() as Array<{
-        playlist_id: string;
-        local_path: string;
-        snapshot_id: string;
-        last_synced_at: string;
-        track_hash: string;
-      }>;
+    const result = this.db.exec('SELECT * FROM playlist_mappings');
 
-    return rows.map((row) => ({
-      playlistId: row.playlist_id,
-      localPath: row.local_path,
-      snapshotId: row.snapshot_id,
-      lastSyncedAt: row.last_synced_at,
-      trackHash: row.track_hash,
+    if (result.length === 0) return [];
+
+    return result[0].values.map((row) => ({
+      playlistId: String(row[0]),
+      localPath: String(row[1]),
+      snapshotId: String(row[2]),
+      lastSyncedAt: String(row[3]),
+      trackHash: String(row[4]),
     }));
   }
 
   upsertPlaylistMapping(mapping: DbPlaylistMapping): void {
-    this.db
-      .prepare(
-        `INSERT OR REPLACE INTO playlist_mappings
-         (playlist_id, local_path, snapshot_id, last_synced_at, track_hash)
-         VALUES (?, ?, ?, ?, ?)`
-      )
-      .run(
+    this.db.run(
+      `INSERT OR REPLACE INTO playlist_mappings
+       (playlist_id, local_path, snapshot_id, last_synced_at, track_hash)
+       VALUES (?, ?, ?, ?, ?)`,
+      [
         mapping.playlistId,
         mapping.localPath,
         mapping.snapshotId,
         mapping.lastSyncedAt,
-        mapping.trackHash
-      );
+        mapping.trackHash,
+      ]
+    );
+    this.save();
   }
 
   deletePlaylistMapping(playlistId: string): void {
-    this.db
-      .prepare('DELETE FROM playlist_mappings WHERE playlist_id = ?')
-      .run(playlistId);
+    this.db.run('DELETE FROM playlist_mappings WHERE playlist_id = ?', [playlistId]);
+    this.save();
   }
 
   // Sync log
@@ -196,173 +214,140 @@ export class StateStore {
     success: boolean,
     errorMessage?: string
   ): number {
-    const result = this.db
-      .prepare(
-        `INSERT INTO sync_log (timestamp, operation_type, playlist_id, details, success, error_message)
-         VALUES (?, ?, ?, ?, ?, ?)`
-      )
-      .run(
+    this.db.run(
+      `INSERT INTO sync_log (timestamp, operation_type, playlist_id, details, success, error_message)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [
         new Date().toISOString(),
         operationType,
         playlistId,
         details,
         success ? 1 : 0,
-        errorMessage || null
-      );
+        errorMessage || null,
+      ]
+    );
+    this.save();
 
-    return result.lastInsertRowid as number;
+    // Get last insert rowid
+    const result = this.db.exec('SELECT last_insert_rowid()');
+    return Number(result[0].values[0][0]);
   }
 
   getRecentSyncLogs(limit = 100): DbSyncLog[] {
-    const rows = this.db
-      .prepare(
-        'SELECT * FROM sync_log ORDER BY timestamp DESC LIMIT ?'
-      )
-      .all(limit) as Array<{
-        id: number;
-        timestamp: string;
-        operation_type: string;
-        playlist_id: string | null;
-        details: string;
-        success: number;
-        error_message: string | null;
-      }>;
+    const result = this.db.exec(
+      'SELECT * FROM sync_log ORDER BY timestamp DESC LIMIT ?',
+      [limit]
+    );
 
-    return rows.map((row) => ({
-      id: row.id,
-      timestamp: row.timestamp,
-      operationType: row.operation_type,
-      playlistId: row.playlist_id,
-      details: row.details,
-      success: row.success === 1,
-      errorMessage: row.error_message,
+    if (result.length === 0) return [];
+
+    return result[0].values.map((row) => ({
+      id: Number(row[0]),
+      timestamp: String(row[1]),
+      operationType: String(row[2]),
+      playlistId: row[3] ? String(row[3]) : null,
+      details: String(row[4]),
+      success: row[5] === 1,
+      errorMessage: row[6] ? String(row[6]) : null,
     }));
   }
 
   // Proposals
   saveProposal(proposal: DbProposal): void {
-    this.db
-      .prepare(
-        `INSERT INTO proposals (id, branch_name, user_prompt, metadata, created_at, status)
-         VALUES (?, ?, ?, ?, ?, ?)`
-      )
-      .run(
+    this.db.run(
+      `INSERT INTO proposals (id, branch_name, user_prompt, metadata, created_at, status)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [
         proposal.id,
         proposal.branchName,
         proposal.userPrompt,
         proposal.metadata,
         proposal.createdAt,
-        proposal.status
-      );
+        proposal.status,
+      ]
+    );
+    this.save();
   }
 
   getProposal(id: string): DbProposal | null {
-    const row = this.db
-      .prepare('SELECT * FROM proposals WHERE id = ?')
-      .get(id) as {
-        id: string;
-        branch_name: string;
-        user_prompt: string;
-        metadata: string;
-        created_at: string;
-        status: string;
-      } | undefined;
+    const result = this.db.exec('SELECT * FROM proposals WHERE id = ?', [id]);
 
-    if (!row) return null;
+    if (result.length === 0 || result[0].values.length === 0) return null;
 
+    const row = result[0].values[0];
     return {
-      id: row.id,
-      branchName: row.branch_name,
-      userPrompt: row.user_prompt,
-      metadata: row.metadata,
-      createdAt: row.created_at,
-      status: row.status,
+      id: String(row[0]),
+      branchName: String(row[1]),
+      userPrompt: String(row[2]),
+      metadata: String(row[3]),
+      createdAt: String(row[4]),
+      status: String(row[5]),
     };
   }
 
   getProposalByBranch(branchName: string): DbProposal | null {
-    const row = this.db
-      .prepare('SELECT * FROM proposals WHERE branch_name = ?')
-      .get(branchName) as {
-        id: string;
-        branch_name: string;
-        user_prompt: string;
-        metadata: string;
-        created_at: string;
-        status: string;
-      } | undefined;
+    const result = this.db.exec('SELECT * FROM proposals WHERE branch_name = ?', [branchName]);
 
-    if (!row) return null;
+    if (result.length === 0 || result[0].values.length === 0) return null;
 
+    const row = result[0].values[0];
     return {
-      id: row.id,
-      branchName: row.branch_name,
-      userPrompt: row.user_prompt,
-      metadata: row.metadata,
-      createdAt: row.created_at,
-      status: row.status,
+      id: String(row[0]),
+      branchName: String(row[1]),
+      userPrompt: String(row[2]),
+      metadata: String(row[3]),
+      createdAt: String(row[4]),
+      status: String(row[5]),
     };
   }
 
   getPendingProposals(): DbProposal[] {
-    const rows = this.db
-      .prepare("SELECT * FROM proposals WHERE status = 'pending' ORDER BY created_at DESC")
-      .all() as Array<{
-        id: string;
-        branch_name: string;
-        user_prompt: string;
-        metadata: string;
-        created_at: string;
-        status: string;
-      }>;
+    const result = this.db.exec(
+      "SELECT * FROM proposals WHERE status = 'pending' ORDER BY created_at DESC"
+    );
 
-    return rows.map((row) => ({
-      id: row.id,
-      branchName: row.branch_name,
-      userPrompt: row.user_prompt,
-      metadata: row.metadata,
-      createdAt: row.created_at,
-      status: row.status,
+    if (result.length === 0) return [];
+
+    return result[0].values.map((row) => ({
+      id: String(row[0]),
+      branchName: String(row[1]),
+      userPrompt: String(row[2]),
+      metadata: String(row[3]),
+      createdAt: String(row[4]),
+      status: String(row[5]),
     }));
   }
 
   updateProposalStatus(id: string, status: string): void {
-    this.db
-      .prepare('UPDATE proposals SET status = ? WHERE id = ?')
-      .run(status, id);
+    this.db.run('UPDATE proposals SET status = ? WHERE id = ?', [status, id]);
+    this.save();
   }
 
   // Tombstones
   addTombstone(entityType: string, entityId: string): void {
-    this.db
-      .prepare(
-        `INSERT OR REPLACE INTO tombstones (entity_type, entity_id, deleted_at)
-         VALUES (?, ?, ?)`
-      )
-      .run(entityType, entityId, new Date().toISOString());
+    this.db.run(
+      `INSERT OR REPLACE INTO tombstones (entity_type, entity_id, deleted_at)
+       VALUES (?, ?, ?)`,
+      [entityType, entityId, new Date().toISOString()]
+    );
+    this.save();
   }
 
   isTombstoned(entityType: string, entityId: string): boolean {
-    const row = this.db
-      .prepare(
-        'SELECT 1 FROM tombstones WHERE entity_type = ? AND entity_id = ?'
-      )
-      .get(entityType, entityId);
+    const result = this.db.exec(
+      'SELECT 1 FROM tombstones WHERE entity_type = ? AND entity_id = ?',
+      [entityType, entityId]
+    );
 
-    return !!row;
+    return result.length > 0 && result[0].values.length > 0;
   }
 
   removeTombstone(entityType: string, entityId: string): void {
-    this.db
-      .prepare(
-        'DELETE FROM tombstones WHERE entity_type = ? AND entity_id = ?'
-      )
-      .run(entityType, entityId);
-  }
-
-  // Transaction support
-  transaction<T>(fn: () => T): T {
-    return this.db.transaction(fn)();
+    this.db.run(
+      'DELETE FROM tombstones WHERE entity_type = ? AND entity_id = ?',
+      [entityType, entityId]
+    );
+    this.save();
   }
 
   close(): void {

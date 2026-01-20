@@ -2,7 +2,9 @@ import type { SpotifyClient } from '../spotify/client.js';
 import type { FilesystemSerializer } from '../filesystem/serializer.js';
 import type { GitManager } from '../git/manager.js';
 import type { StateStore } from '../state/database.js';
-import { ChatbotPlanner } from './planner.js';
+import { LibraryDatabase } from '../state/library.js';
+import { MarkdownGenerator } from '../filesystem/markdown.js';
+import { ChatbotPlanner, type LibraryContext } from './planner.js';
 import { ChatbotExecutor } from './executor.js';
 
 export interface ChatbotOptions {
@@ -30,6 +32,9 @@ export class ChatbotOrchestrator {
   private spotifyClient: SpotifyClient;
   private serializer: FilesystemSerializer;
   private gitManager: GitManager;
+  private libraryDb: LibraryDatabase;
+  private markdownGenerator: MarkdownGenerator;
+  private workspacePath: string;
 
   constructor(
     spotifyClient: SpotifyClient,
@@ -41,13 +46,21 @@ export class ChatbotOrchestrator {
     this.spotifyClient = spotifyClient;
     this.serializer = serializer;
     this.gitManager = gitManager;
+    this.workspacePath = workspacePath;
+
+    // Initialize library database and markdown generator
+    this.libraryDb = new LibraryDatabase(workspacePath);
+    this.markdownGenerator = new MarkdownGenerator(workspacePath);
+
     this.planner = new ChatbotPlanner();
     this.executor = new ChatbotExecutor(
       spotifyClient,
       serializer,
       gitManager,
       stateStore,
-      workspacePath
+      workspacePath,
+      this.libraryDb,
+      this.markdownGenerator
     );
   }
 
@@ -55,16 +68,14 @@ export class ChatbotOrchestrator {
     prompt: string,
     options: ChatbotOptions = {}
   ): Promise<ChatbotResult> {
-    const errors: string[] = [];
-
     try {
-      // Step 1: Read existing playlists for context
-      const existingPlaylists = this.serializer.readAllPlaylists();
+      // Step 1: Build library context for the planner
+      const context = this.buildLibraryContext();
 
       // Step 2: Generate a plan using GPT-5
       const { plan, confidence, interpretation } = await this.planner.generatePlan(
         prompt,
-        existingPlaylists
+        context
       );
 
       if (confidence < 0.5) {
@@ -91,7 +102,12 @@ export class ChatbotOrchestrator {
         createBranch: options.createBranch !== false,
       });
 
-      // Step 5: Build result
+      // Step 5: Generate markdown files after changes
+      if (result.success) {
+        this.markdownGenerator.generateAll(this.libraryDb);
+      }
+
+      // Step 6: Build result
       const changes = {
         playlistsCreated: result.context.createdPlaylists.length,
         playlistsModified: result.context.modifiedPlaylists.length,
@@ -108,7 +124,22 @@ export class ChatbotOrchestrator {
         summary += `. Added ${changes.tracksAdded} tracks`;
       }
 
-      // Step 6: If not auto-applying, switch back to original branch
+      // Include SQL query/execute summaries if any
+      if (result.context.queryResults.size > 0) {
+        const queryCount = result.context.queryResults.size;
+        summary += `. Executed ${queryCount} SQL quer${queryCount === 1 ? 'y' : 'ies'}`;
+      }
+      if (result.context.executeResults.size > 0) {
+        let totalChanges = 0;
+        for (const r of result.context.executeResults.values()) {
+          totalChanges += r.changes;
+        }
+        if (totalChanges > 0) {
+          summary += `. Modified ${totalChanges} database row${totalChanges === 1 ? '' : 's'}`;
+        }
+      }
+
+      // Step 7: If not auto-applying, switch back to original branch
       let applied = false;
       if (options.autoApply && result.context.branchName) {
         // Apply would be done via the sync engine
@@ -144,6 +175,37 @@ export class ChatbotOrchestrator {
     }
   }
 
+  private buildLibraryContext(): LibraryContext {
+    const schema = this.libraryDb.getSchema();
+    const stats = this.libraryDb.getStats();
+
+    // Build playlist summary
+    const playlists = this.libraryDb.getAllPlaylists();
+    let playlistSummary = '### Playlists\n\n';
+
+    if (playlists.length === 0) {
+      playlistSummary += 'No playlists in library yet.\n';
+    } else {
+      playlistSummary += '| ID | Name | Tracks | Last Synced |\n';
+      playlistSummary += '|-----|------|--------|-------------|\n';
+      for (const p of playlists.slice(0, 50)) { // Limit to 50 for context size
+        const syncedAt = p.last_synced_at
+          ? new Date(p.last_synced_at).toLocaleDateString()
+          : 'never';
+        playlistSummary += `| ${p.id} | ${p.name} | ${p.track_count} | ${syncedAt} |\n`;
+      }
+      if (playlists.length > 50) {
+        playlistSummary += `\n_...and ${playlists.length - 50} more playlists_\n`;
+      }
+    }
+
+    return {
+      schema,
+      stats,
+      playlistSummary,
+    };
+  }
+
   async getProposals(): Promise<
     Array<{
       id: string;
@@ -166,5 +228,26 @@ export class ChatbotOrchestrator {
         status: metadata?.status || 'unknown',
       };
     });
+  }
+
+  /**
+   * Get the library database for direct queries (useful for CLI)
+   */
+  getLibraryDatabase(): LibraryDatabase {
+    return this.libraryDb;
+  }
+
+  /**
+   * Get the markdown generator (useful for manual regeneration)
+   */
+  getMarkdownGenerator(): MarkdownGenerator {
+    return this.markdownGenerator;
+  }
+
+  /**
+   * Close database connections
+   */
+  close(): void {
+    this.libraryDb.close();
   }
 }

@@ -1,10 +1,6 @@
 import OpenAI from 'openai';
 import { z } from 'zod';
-import type {
-  ChatbotPlan,
-  PlanStep,
-  LocalPlaylist,
-} from '../types/index.js';
+import type { ChatbotPlan, PlanStep } from '../types/index.js';
 
 // Zod schemas for structured output validation
 const FilterCriteriaSchema = z.object({
@@ -22,16 +18,33 @@ const FilterCriteriaSchema = z.object({
 });
 
 const PlanStepSchema = z.discriminatedUnion('type', [
+  // Spotify API operations
   z.object({ type: z.literal('search_tracks'), query: z.string(), limit: z.number() }),
-  z.object({ type: z.literal('list_playlists') }),
-  z.object({ type: z.literal('fetch_playlist_tracks'), playlistId: z.string() }),
   z.object({ type: z.literal('fetch_saved_tracks'), limit: z.number() }),
   z.object({ type: z.literal('filter_tracks'), criteria: FilterCriteriaSchema }),
-  z.object({ type: z.literal('create_playlist'), name: z.string() }),
+
+  // SQL operations (local database)
+  z.object({ type: z.literal('sql_query'), query: z.string(), description: z.string() }),
+  z.object({ type: z.literal('sql_execute'), query: z.string(), description: z.string() }),
+
+  // Playlist operations
+  z.object({ type: z.literal('create_playlist'), name: z.string(), description: z.string().optional() }),
+  z.object({ type: z.literal('delete_playlist'), playlistId: z.string() }),
+  z.object({ type: z.literal('rename_playlist'), playlistId: z.string(), newName: z.string() }),
+
+  // Track operations
   z.object({ type: z.literal('add_tracks_to_playlist'), playlistId: z.string(), trackIds: z.array(z.string()) }),
   z.object({ type: z.literal('remove_tracks_from_playlist'), playlistId: z.string(), trackIds: z.array(z.string()) }),
+  z.object({ type: z.literal('move_tracks'), fromPlaylistId: z.string(), toPlaylistId: z.string(), trackIds: z.array(z.string()) }),
+  z.object({ type: z.literal('reorder_tracks'), playlistId: z.string(), trackIds: z.array(z.string()) }),
+
+  // Git operations
   z.object({ type: z.literal('create_branch'), name: z.string() }),
   z.object({ type: z.literal('commit_changes'), message: z.string() }),
+
+  // Sync operations
+  z.object({ type: z.literal('sync_to_spotify') }),
+  z.object({ type: z.literal('generate_markdown') }),
 ]);
 
 const ChatbotPlanSchema = z.object({
@@ -57,71 +70,124 @@ export interface PlannerResult {
   interpretation: string;
 }
 
-const SYSTEM_PROMPT = `You are the SpotifyFS Planner, an AI that helps users manage their Spotify playlists through a local filesystem interface.
+export interface LibraryContext {
+  schema: string;
+  stats: { playlists: number; tracks: number; totalPlaylistTracks: number };
+  playlistSummary: string;
+}
 
-Your job is to analyze user requests and create a structured plan of steps to accomplish their goal.
+const SYSTEM_PROMPT = `You are the SpotifyFS Planner, an AI that helps users manage their Spotify playlists.
+
+The user's music library is stored in a SQLite database. You can query and modify it using SQL, similar to how you might reorganize a codebase using shell commands.
 
 ## Available Step Types
 
-You can use the following step types in your plan:
+### SQL Operations (for reading and modifying local library)
 
-1. **search_tracks** - Search Spotify for tracks
+1. **sql_query** - Execute a SELECT query to read data
+   - query: string (SQL SELECT statement)
+   - description: string (what this query does)
+
+2. **sql_execute** - Execute INSERT/UPDATE/DELETE to modify data
+   - query: string (SQL modification statement)
+   - description: string (what this change does)
+
+### Spotify API Operations (for fetching new data)
+
+3. **search_tracks** - Search Spotify for new tracks to add
    - query: string (search query)
-   - limit: number (max tracks to return, recommend 50-100)
+   - limit: number (max results, recommend 50-100)
 
-2. **list_playlists** - Get all user's playlists (read-only, for gathering info)
-
-3. **fetch_playlist_tracks** - Get all tracks from a specific playlist
-   - playlistId: string (the playlist ID)
-
-4. **fetch_saved_tracks** - Get user's liked/saved tracks
+4. **fetch_saved_tracks** - Get user's liked tracks from Spotify
    - limit: number (max tracks, recommend 200-500)
 
-5. **filter_tracks** - Filter collected tracks by criteria
-   - criteria: object with optional fields:
-     - genres: string[] (genre keywords to match)
-     - artists: string[] (artist names to match)
-     - keywords: string[] (keywords to search in track/artist/album names)
-     - yearRange: { start: number, end: number }
-     - energyRange: { min: number, max: number } (0-1 scale)
+5. **filter_tracks** - Filter fetched tracks by criteria before adding
+   - criteria: { genres?, artists?, keywords?, yearRange?, energyRange? }
+
+### Playlist Operations
 
 6. **create_playlist** - Create a new playlist
-   - name: string (playlist name)
+   - name: string
+   - description: string (optional)
 
-7. **add_tracks_to_playlist** - Add tracks to an existing playlist
+7. **delete_playlist** - Delete a playlist
    - playlistId: string
-   - trackIds: string[] (can be empty if using filtered tracks from context)
 
-8. **remove_tracks_from_playlist** - Remove tracks from a playlist
+8. **rename_playlist** - Rename a playlist
    - playlistId: string
-   - trackIds: string[]
+   - newName: string
 
-9. **create_branch** - Create a Git branch for the changes (always do this before making changes)
-   - name: string (branch name, use lowercase with hyphens)
+### Track Operations
 
-10. **commit_changes** - Commit the changes to Git (always do this after making changes)
-    - message: string (commit message)
+9. **add_tracks_to_playlist** - Add tracks to a playlist
+   - playlistId: string
+   - trackIds: string[] (array of track IDs)
+
+10. **remove_tracks_from_playlist** - Remove tracks from a playlist
+    - playlistId: string
+    - trackIds: string[]
+
+11. **move_tracks** - Move tracks from one playlist to another
+    - fromPlaylistId: string
+    - toPlaylistId: string
+    - trackIds: string[]
+
+12. **reorder_tracks** - Reorder tracks in a playlist
+    - playlistId: string
+    - trackIds: string[] (new order)
+
+### Git & Sync Operations
+
+13. **create_branch** - Create a Git branch before making changes
+    - name: string (lowercase with hyphens)
+
+14. **commit_changes** - Commit changes to Git
+    - message: string
+
+15. **sync_to_spotify** - Push local changes to Spotify
+
+16. **generate_markdown** - Regenerate markdown files for Git tracking
+
+## Database Schema
+
+{SCHEMA}
 
 ## Planning Guidelines
 
-1. Always start with a **create_branch** step before making any changes
-2. Always end with a **commit_changes** step after making changes
-3. Gather data first (search, fetch), then filter, then create/modify
-4. When creating playlists based on genres or moods, use both search_tracks AND fetch_saved_tracks for better results
-5. Use filter_tracks to narrow down collected tracks to match the user's intent
-6. Be generous with track limits - it's better to collect more and filter than to miss good tracks
-7. For genre-based requests, include relevant keywords in the filter criteria
+1. **Use SQL for analysis**: Before making changes, query the database to understand the current state
+2. **SQL for bulk operations**: Use SQL UPDATE/DELETE for bulk changes instead of individual operations
+3. **Always create a branch first**: Before modifying data, create a Git branch
+4. **Commit and generate markdown**: After changes, commit and regenerate markdown files
+5. **Be precise with SQL**: Write exact SQL queries - the executor will run them directly
+6. **Track IDs matter**: When moving/adding tracks, always use track IDs from query results
+
+## Example Patterns
+
+### Find and remove duplicates:
+\`\`\`
+1. sql_query: "SELECT track_id, COUNT(*) as cnt FROM playlist_tracks GROUP BY track_id HAVING cnt > 1"
+2. sql_execute: "DELETE FROM playlist_tracks WHERE rowid NOT IN (SELECT MIN(rowid) FROM playlist_tracks GROUP BY playlist_id, track_id)"
+\`\`\`
+
+### Move all tracks by artist to a playlist:
+\`\`\`
+1. sql_query: "SELECT id FROM tracks WHERE artists LIKE '%Artist Name%'"
+2. sql_execute: "INSERT INTO playlist_tracks (playlist_id, track_id, position) SELECT 'target_id', id, ROW_NUMBER() OVER() FROM tracks WHERE artists LIKE '%Artist Name%'"
+\`\`\`
+
+### Create playlist from search results:
+\`\`\`
+1. search_tracks: "jazz bossa nova"
+2. create_playlist: "Jazz & Bossa"
+3. add_tracks_to_playlist: (use collected track IDs)
+\`\`\`
 
 ## Response Format
 
-You must respond with a JSON object containing:
+Respond with a JSON object containing:
 - plan: The structured plan with intent, steps, and estimatedChanges
-- confidence: A number 0-1 indicating how confident you are in understanding the request
-- interpretation: A human-readable summary of what you understood and will do
-
-## Existing Playlists Context
-
-The user's existing playlists will be provided. Use their IDs when referencing existing playlists.
+- confidence: A number 0-1 indicating confidence in understanding the request
+- interpretation: A human-readable summary of what you will do
 `;
 
 export class ChatbotPlanner {
@@ -136,13 +202,21 @@ export class ChatbotPlanner {
 
   async generatePlan(
     prompt: string,
-    existingPlaylists: LocalPlaylist[]
+    context: LibraryContext
   ): Promise<PlannerResult> {
-    const playlistContext = existingPlaylists.length > 0
-      ? `\n\nUser's existing playlists:\n${existingPlaylists
-          .map((p) => `- "${p.name}" (ID: ${p.playlistId}, ${p.tracks.length} tracks)`)
-          .join('\n')}`
-      : '\n\nUser has no existing playlists yet.';
+    const systemPrompt = SYSTEM_PROMPT.replace('{SCHEMA}', context.schema);
+
+    const userContext = `
+## Current Library State
+
+${context.playlistSummary}
+
+Statistics: ${context.stats.playlists} playlists, ${context.stats.tracks} unique tracks, ${context.stats.totalPlaylistTracks} total playlist entries
+
+## User Request
+
+${prompt}
+`;
 
     try {
       const response = await this.openai.chat.completions.create({
@@ -150,11 +224,11 @@ export class ChatbotPlanner {
         messages: [
           {
             role: 'system',
-            content: SYSTEM_PROMPT + playlistContext,
+            content: systemPrompt,
           },
           {
             role: 'user',
-            content: prompt,
+            content: userContext,
           },
         ],
         response_format: { type: 'json_object' },
@@ -175,14 +249,12 @@ export class ChatbotPlanner {
         interpretation: validated.interpretation,
       };
     } catch (error) {
-      // If LLM fails, return a low-confidence fallback
       console.error('LLM planning failed:', error);
       return this.fallbackPlan(prompt);
     }
   }
 
   private fallbackPlan(prompt: string): PlannerResult {
-    // Simple fallback if LLM is unavailable
     const words = prompt.split(/\s+/).slice(0, 3);
     const playlistName = words.join(' ') + ' Playlist';
     const branchName = words.join('-').toLowerCase();
@@ -208,16 +280,12 @@ export class ChatbotPlanner {
     };
   }
 
-  // Utility method to extract search queries (can still be useful)
   extractSearchQueries(prompt: string): string[] {
     const queries: string[] = [prompt];
-
-    // Extract quoted strings
     const quotedMatches = prompt.match(/"([^"]+)"/g);
     if (quotedMatches) {
       queries.push(...quotedMatches.map((m) => m.replace(/"/g, '')));
     }
-
     return [...new Set(queries)];
   }
 }

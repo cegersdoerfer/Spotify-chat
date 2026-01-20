@@ -9,6 +9,8 @@ import type {
 import type { SpotifyClient } from '../spotify/client.js';
 import type { StateStore } from '../state/database.js';
 import type { FilesystemSerializer } from '../filesystem/serializer.js';
+import type { LibraryDatabase } from '../state/library.js';
+import type { MarkdownGenerator } from '../filesystem/markdown.js';
 import { computeTrackListHash, trackIdToUri } from '../utils/index.js';
 import { computePullDiff, computePushPlan, optimizePlan, type DiffContext } from './diff.js';
 
@@ -23,17 +25,23 @@ export class SyncEngine {
   private stateStore: StateStore;
   private serializer: FilesystemSerializer;
   private userId: string;
+  private libraryDb?: LibraryDatabase;
+  private markdownGenerator?: MarkdownGenerator;
 
   constructor(
     spotifyClient: SpotifyClient,
     stateStore: StateStore,
     serializer: FilesystemSerializer,
-    userId: string
+    userId: string,
+    libraryDb?: LibraryDatabase,
+    markdownGenerator?: MarkdownGenerator
   ) {
     this.spotifyClient = spotifyClient;
     this.stateStore = stateStore;
     this.serializer = serializer;
     this.userId = userId;
+    this.libraryDb = libraryDb;
+    this.markdownGenerator = markdownGenerator;
   }
 
   async pull(options: SyncEngineOptions = {}): Promise<SyncResult> {
@@ -63,7 +71,14 @@ export class SyncEngine {
       // Apply changes
       for (const playlist of diff.toCreate) {
         try {
+          // Write to filesystem
           const path = this.serializer.writePlaylist(playlist);
+
+          // Write to library database
+          if (this.libraryDb) {
+            this.libraryDb.importPlaylist(playlist);
+          }
+
           this.stateStore.upsertPlaylistMapping({
             playlistId: playlist.id,
             localPath: path,
@@ -89,6 +104,12 @@ export class SyncEngine {
         try {
           // Overwrite local with remote
           this.serializer.writePlaylist(remote);
+
+          // Update library database
+          if (this.libraryDb) {
+            this.libraryDb.importPlaylist(remote);
+          }
+
           this.stateStore.upsertPlaylistMapping({
             playlistId: remote.id,
             localPath: local.folderPath,
@@ -113,6 +134,12 @@ export class SyncEngine {
       for (const playlist of diff.toDelete) {
         try {
           this.serializer.deletePlaylist(playlist.folderPath);
+
+          // Delete from library database
+          if (this.libraryDb) {
+            this.libraryDb.deletePlaylist(playlist.playlistId);
+          }
+
           this.stateStore.deletePlaylistMapping(playlist.playlistId);
           this.stateStore.addTombstone('playlist', playlist.playlistId);
           this.stateStore.logSyncOperation(
@@ -127,6 +154,11 @@ export class SyncEngine {
             error: String(error),
           });
         }
+      }
+
+      // Regenerate markdown files after pull
+      if (this.libraryDb && this.markdownGenerator) {
+        this.markdownGenerator.generateAll(this.libraryDb);
       }
 
       return {
@@ -150,7 +182,7 @@ export class SyncEngine {
       // Fetch all remote playlists
       const remotePlaylists = await this.fetchAllRemotePlaylists();
 
-      // Read all local playlists
+      // Read all local playlists (prefer from library DB if available)
       const localPlaylists = this.readAllLocalPlaylists();
 
       // Build context map from stored state
@@ -229,6 +261,12 @@ export class SyncEngine {
       for (const operation of appliedOperations) {
         if ('playlistId' in operation && operation.type !== 'delete_playlist') {
           const remote = await this.spotifyClient.getPlaylistWithTracks(operation.playlistId);
+
+          // Update library database with new remote state
+          if (this.libraryDb) {
+            this.libraryDb.importPlaylist(remote);
+          }
+
           this.stateStore.upsertPlaylistMapping({
             playlistId: operation.playlistId,
             localPath:
@@ -238,6 +276,11 @@ export class SyncEngine {
             trackHash: computeTrackListHash(remote.tracks.map((t) => t.id)),
           });
         }
+      }
+
+      // Regenerate markdown files after push
+      if (this.libraryDb && this.markdownGenerator) {
+        this.markdownGenerator.generateAll(this.libraryDb);
       }
 
       return {
@@ -259,6 +302,7 @@ export class SyncEngine {
     pendingAdditions: number;
     pendingRemovals: number;
     conflicts: number;
+    libraryStats?: { playlists: number; tracks: number; totalPlaylistTracks: number };
   }> {
     const remotePlaylists = await this.fetchAllRemotePlaylists();
     const localPlaylists = this.readAllLocalPlaylists();
@@ -289,13 +333,27 @@ export class SyncEngine {
       }
     }
 
-    return {
+    const result: {
+      localPlaylists: number;
+      remotePlaylists: number;
+      pendingAdditions: number;
+      pendingRemovals: number;
+      conflicts: number;
+      libraryStats?: { playlists: number; tracks: number; totalPlaylistTracks: number };
+    } = {
       localPlaylists: localPlaylists.size,
       remotePlaylists: remotePlaylists.size,
       pendingAdditions,
       pendingRemovals,
       conflicts: plan.conflicts.length,
     };
+
+    // Include library database stats if available
+    if (this.libraryDb) {
+      result.libraryStats = this.libraryDb.getStats();
+    }
+
+    return result;
   }
 
   async diff(): Promise<PlaylistDiff[]> {
@@ -414,7 +472,14 @@ export class SyncEngine {
         break;
       }
 
-      case 'reorder_tracks':
+      case 'reorder_tracks': {
+        await this.spotifyClient.replacePlaylistTracks(
+          operation.playlistId,
+          operation.newOrder.map(trackIdToUri)
+        );
+        break;
+      }
+
       case 'replace_tracks': {
         await this.spotifyClient.replacePlaylistTracks(
           operation.playlistId,
