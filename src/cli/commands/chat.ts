@@ -17,11 +17,11 @@ export function chatCommand(): Command {
 
         const chatbot = new ChatbotOrchestrator(
           ctx.spotify,
-          ctx.serializer,
           ctx.git,
           ctx.store,
           ctx.workspacePath
         );
+        await chatbot.init();
 
         console.log(chalk.blue.bold('\nSpotifyFS Chatbot'));
         console.log(chalk.gray('Ask me to help manage your playlists!\n'));

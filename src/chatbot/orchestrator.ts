@@ -1,5 +1,4 @@
 import type { SpotifyClient } from '../spotify/client.js';
-import type { FilesystemSerializer } from '../filesystem/serializer.js';
 import type { GitManager } from '../git/manager.js';
 import type { StateStore } from '../state/database.js';
 import { LibraryDatabase } from '../state/library.js';
@@ -29,24 +28,17 @@ export interface ChatbotResult {
 export class ChatbotOrchestrator {
   private planner: ChatbotPlanner;
   private executor: ChatbotExecutor;
-  private spotifyClient: SpotifyClient;
-  private serializer: FilesystemSerializer;
   private gitManager: GitManager;
   private libraryDb: LibraryDatabase;
   private markdownGenerator: MarkdownGenerator;
-  private workspacePath: string;
 
   constructor(
     spotifyClient: SpotifyClient,
-    serializer: FilesystemSerializer,
     gitManager: GitManager,
     stateStore: StateStore,
     workspacePath: string
   ) {
-    this.spotifyClient = spotifyClient;
-    this.serializer = serializer;
     this.gitManager = gitManager;
-    this.workspacePath = workspacePath;
 
     // Initialize library database and markdown generator
     this.libraryDb = new LibraryDatabase(workspacePath);
@@ -55,13 +47,15 @@ export class ChatbotOrchestrator {
     this.planner = new ChatbotPlanner();
     this.executor = new ChatbotExecutor(
       spotifyClient,
-      serializer,
       gitManager,
       stateStore,
-      workspacePath,
       this.libraryDb,
       this.markdownGenerator
     );
+  }
+
+  async init(): Promise<void> {
+    await this.libraryDb.init();
   }
 
   async processRequest(
@@ -142,11 +136,8 @@ export class ChatbotOrchestrator {
       // Step 7: If not auto-applying, switch back to original branch
       let applied = false;
       if (options.autoApply && result.context.branchName) {
-        // Apply would be done via the sync engine
-        // For now, we stay on the proposal branch
         applied = false; // Would need to actually push to Spotify
       } else if (result.context.branchName) {
-        // Switch back to original branch
         await this.gitManager.checkout(originalBranch);
       }
 
@@ -188,7 +179,7 @@ export class ChatbotOrchestrator {
     } else {
       playlistSummary += '| ID | Name | Tracks | Last Synced |\n';
       playlistSummary += '|-----|------|--------|-------------|\n';
-      for (const p of playlists.slice(0, 50)) { // Limit to 50 for context size
+      for (const p of playlists.slice(0, 50)) {
         const syncedAt = p.last_synced_at
           ? new Date(p.last_synced_at).toLocaleDateString()
           : 'never';

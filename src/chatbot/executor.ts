@@ -6,7 +6,6 @@ import type {
   ProposalMetadata,
 } from '../types/index.js';
 import type { SpotifyClient } from '../spotify/client.js';
-import type { FilesystemSerializer } from '../filesystem/serializer.js';
 import type { GitManager } from '../git/manager.js';
 import type { StateStore } from '../state/database.js';
 import type { LibraryDatabase } from '../state/library.js';
@@ -31,27 +30,21 @@ export interface ExecutorResult {
 
 export class ChatbotExecutor {
   private spotifyClient: SpotifyClient;
-  private serializer: FilesystemSerializer;
   private gitManager: GitManager;
   private stateStore: StateStore;
-  private workspacePath: string;
   private libraryDb: LibraryDatabase;
   private markdownGenerator: MarkdownGenerator;
 
   constructor(
     spotifyClient: SpotifyClient,
-    serializer: FilesystemSerializer,
     gitManager: GitManager,
     stateStore: StateStore,
-    workspacePath: string,
     libraryDb: LibraryDatabase,
     markdownGenerator: MarkdownGenerator
   ) {
     this.spotifyClient = spotifyClient;
-    this.serializer = serializer;
     this.gitManager = gitManager;
     this.stateStore = stateStore;
-    this.workspacePath = workspacePath;
     this.libraryDb = libraryDb;
     this.markdownGenerator = markdownGenerator;
   }
@@ -118,7 +111,7 @@ export class ChatbotExecutor {
         const result = await this.spotifyClient.searchTracks(step.query, step.limit);
         context.collectedTracks.push(...result.items);
 
-        // Also cache these tracks in the library database
+        // Cache these tracks in the library database
         this.libraryDb.upsertTracks(result.items);
         break;
       }
@@ -179,13 +172,6 @@ export class ChatbotExecutor {
           this.libraryDb.setPlaylistTracks(playlistId, tracksToAdd);
         }
 
-        // Also create in filesystem for backwards compatibility
-        const path = this.serializer.createPlaylistFolder(step.name, playlistId);
-        for (let i = 0; i < tracksToAdd.length; i++) {
-          const track = tracksToAdd[i];
-          this.serializer.addTrack(path, track, i + 1);
-        }
-
         context.createdPlaylists.push(step.name);
         break;
       }
@@ -196,12 +182,6 @@ export class ChatbotExecutor {
 
         // Delete from database
         this.libraryDb.deletePlaylist(step.playlistId);
-
-        // Also remove from filesystem
-        const deletePath = this.serializer.getPlaylistPathById(step.playlistId);
-        if (deletePath) {
-          this.serializer.deletePlaylist(deletePath);
-        }
 
         // Remove markdown file
         if (playlistToDelete) {
@@ -218,12 +198,6 @@ export class ChatbotExecutor {
 
         // Rename in database
         this.libraryDb.renamePlaylist(step.playlistId, step.newName);
-
-        // Rename in filesystem
-        const renamePath = this.serializer.getPlaylistPathById(step.playlistId);
-        if (renamePath) {
-          this.serializer.renamePlaylist(renamePath, step.newName, step.playlistId);
-        }
 
         // Update markdown (remove old, regenerate new)
         if (oldPlaylist) {
@@ -252,14 +226,6 @@ export class ChatbotExecutor {
           this.libraryDb.addTrackToPlaylist(step.playlistId, trackId);
         }
 
-        // Also add to filesystem for backwards compatibility
-        const path = this.serializer.getPlaylistPathById(step.playlistId);
-        if (path) {
-          for (const track of tracks.filter(t => trackIdsToAdd.includes(t.id))) {
-            this.serializer.addTrack(path, track);
-          }
-        }
-
         context.modifiedPlaylists.push(step.playlistId);
         break;
       }
@@ -268,14 +234,6 @@ export class ChatbotExecutor {
         // Remove from database
         for (const trackId of step.trackIds) {
           this.libraryDb.removeTrackFromPlaylist(step.playlistId, trackId);
-        }
-
-        // Also remove from filesystem
-        const path = this.serializer.getPlaylistPathById(step.playlistId);
-        if (path) {
-          for (const trackId of step.trackIds) {
-            this.serializer.removeTrack(path, trackId);
-          }
         }
 
         context.modifiedPlaylists.push(step.playlistId);
@@ -350,7 +308,6 @@ export class ChatbotExecutor {
       // ==================== Sync Operations ====================
       case 'sync_to_spotify': {
         // This would trigger the sync engine to push changes to Spotify
-        // For now, we just mark that sync is needed
         console.log('Sync to Spotify requested - changes will be pushed on next sync');
         break;
       }

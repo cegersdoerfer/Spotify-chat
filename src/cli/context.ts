@@ -1,7 +1,7 @@
 import { resolve } from 'path';
-import { ConfigManager, StateStore, findWorkspaceRoot } from '../state/index.js';
+import { ConfigManager, StateStore, LibraryDatabase, findWorkspaceRoot } from '../state/index.js';
 import { SpotifyClient } from '../spotify/index.js';
-import { FilesystemSerializer } from '../filesystem/index.js';
+import { MarkdownGenerator } from '../filesystem/index.js';
 import { SyncEngine } from '../sync/index.js';
 import { GitManager } from '../git/index.js';
 import type { TokenData, WorkspaceConfig } from '../types/index.js';
@@ -11,7 +11,8 @@ export interface CLIContext {
   config: ConfigManager;
   store: StateStore;
   spotify: SpotifyClient;
-  serializer: FilesystemSerializer;
+  libraryDb: LibraryDatabase;
+  markdownGenerator: MarkdownGenerator;
   sync: SyncEngine;
   git: GitManager;
   workspaceConfig: WorkspaceConfig;
@@ -44,13 +45,15 @@ export async function createContext(
   }
 
   const store = new StateStore(root);
+  await store.init();
+
+  const libraryDb = new LibraryDatabase(root);
+  await libraryDb.init();
+
+  const markdownGenerator = new MarkdownGenerator(root);
 
   const spotify = new SpotifyClient(tokens, clientId, async (newTokens: TokenData) => {
     config.saveTokens(newTokens);
-  });
-
-  const serializer = new FilesystemSerializer(root, {
-    orderingMode: workspaceConfig.settings.orderingMode,
   });
 
   // Get user ID for sync engine
@@ -61,7 +64,7 @@ export async function createContext(
     config.updateConfig({ spotifyUserId: userId });
   }
 
-  const sync = new SyncEngine(spotify, store, serializer, userId);
+  const sync = new SyncEngine(spotify, store, userId, libraryDb, markdownGenerator);
   const git = new GitManager(root);
 
   return {
@@ -69,7 +72,8 @@ export async function createContext(
     config,
     store,
     spotify,
-    serializer,
+    libraryDb,
+    markdownGenerator,
     sync,
     git,
     workspaceConfig,
@@ -80,8 +84,8 @@ export function getClientId(): string {
   const clientId = process.env.SPOTIFY_CLIENT_ID;
   if (!clientId) {
     throw new Error(
-      'SPOTIFY_CLIENT_ID environment variable is required.\n' +
-        'Create a Spotify app at https://developer.spotify.com/dashboard and set the client ID.'
+      'SPOTIFY_CLIENT_ID environment variable is not set.\n' +
+        'Set it to your Spotify application client ID.'
     );
   }
   return clientId;
