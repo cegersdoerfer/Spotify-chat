@@ -5,7 +5,7 @@ import type { TokenData } from '../types/index.js';
 
 const SPOTIFY_AUTH_URL = 'https://accounts.spotify.com/authorize';
 const SPOTIFY_TOKEN_URL = 'https://accounts.spotify.com/api/token';
-const REDIRECT_URI = 'http://localhost:8888/callback';
+const REDIRECT_URI = 'http://127.0.0.1:8888/callback';
 
 // Required scopes for SpotifyFS functionality
 const SCOPES = [

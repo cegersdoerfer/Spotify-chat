@@ -31,7 +31,7 @@ npm link
 ## Prerequisites
 
 1. Create a Spotify app at https://developer.spotify.com/dashboard
-2. Set the redirect URI to `http://localhost:8888/callback`
+2. Set the redirect URI to `http://127.0.0.1:8888/callback`
 3. Set the required environment variables:
 
 ```bash
