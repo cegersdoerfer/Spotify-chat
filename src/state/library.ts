@@ -3,7 +3,7 @@ import { join } from 'path';
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import type { SpotifyTrack, SpotifyPlaylist, SpotifyPlaylistWithTracks } from '../types/index.js';
 
-const LIBRARY_SCHEMA_VERSION = 1;
+const LIBRARY_SCHEMA_VERSION = 2;
 
 let SQL: Awaited<ReturnType<typeof initSqlJs>> | null = null;
 
@@ -83,7 +83,8 @@ export class LibraryDatabase {
   private initializeSchema(): void {
     const version = this.getSchemaVersion();
 
-    if (version < LIBRARY_SCHEMA_VERSION) {
+    // Initial schema creation
+    if (version < 1) {
       this.db.run(`
         -- Schema version tracking
         CREATE TABLE IF NOT EXISTS schema_info (
@@ -115,27 +116,34 @@ export class LibraryDatabase {
           uri TEXT NOT NULL
         );
 
-        -- Playlist-Track junction table
-        CREATE TABLE IF NOT EXISTS playlist_tracks (
+        -- Indexes for common queries
+        CREATE INDEX IF NOT EXISTS idx_tracks_artists ON tracks(artists);
+        CREATE INDEX IF NOT EXISTS idx_tracks_name ON tracks(name);
+      `);
+    }
+
+    // Migration v2: Allow duplicate tracks in playlists
+    // Primary key is now (playlist_id, position) instead of (playlist_id, track_id)
+    if (version < 2) {
+      // Drop old table if it exists and recreate with new schema
+      this.db.run(`DROP TABLE IF EXISTS playlist_tracks`);
+      this.db.run(`
+        CREATE TABLE playlist_tracks (
           playlist_id TEXT NOT NULL,
           track_id TEXT NOT NULL,
           position INTEGER NOT NULL,
           added_at TEXT,
-          PRIMARY KEY (playlist_id, track_id),
+          PRIMARY KEY (playlist_id, position),
           FOREIGN KEY (playlist_id) REFERENCES playlists(id) ON DELETE CASCADE,
           FOREIGN KEY (track_id) REFERENCES tracks(id) ON DELETE CASCADE
-        );
-
-        -- Indexes for common queries
-        CREATE INDEX IF NOT EXISTS idx_playlist_tracks_playlist ON playlist_tracks(playlist_id);
-        CREATE INDEX IF NOT EXISTS idx_playlist_tracks_position ON playlist_tracks(playlist_id, position);
-        CREATE INDEX IF NOT EXISTS idx_tracks_artists ON tracks(artists);
-        CREATE INDEX IF NOT EXISTS idx_tracks_name ON tracks(name);
+        )
       `);
-
-      this.setSchemaVersion(LIBRARY_SCHEMA_VERSION);
-      this.save();
+      this.db.run(`CREATE INDEX IF NOT EXISTS idx_playlist_tracks_playlist ON playlist_tracks(playlist_id)`);
+      this.db.run(`CREATE INDEX IF NOT EXISTS idx_playlist_tracks_track ON playlist_tracks(track_id)`);
     }
+
+    this.setSchemaVersion(LIBRARY_SCHEMA_VERSION);
+    this.save();
   }
 
   private getSchemaVersion(): number {
@@ -352,16 +360,16 @@ export class LibraryDatabase {
   }
 
   addTrackToPlaylist(playlistId: string, trackId: string, position?: number): void {
-    const currentTracks = this.getPlaylistTrackIds(playlistId);
+    // Get current track count to determine position
+    const result = this.db.exec(`
+      SELECT COUNT(*) FROM playlist_tracks WHERE playlist_id = ?
+    `, [playlistId]);
+    const currentCount = result.length > 0 ? Number(result[0].values[0][0]) : 0;
 
-    if (currentTracks.includes(trackId)) {
-      return; // Already in playlist
-    }
-
-    const newPosition = position ?? currentTracks.length + 1;
+    const newPosition = position ?? currentCount + 1;
 
     // Shift positions if inserting in middle
-    if (position && position <= currentTracks.length) {
+    if (position && position <= currentCount) {
       this.db.run(`
         UPDATE playlist_tracks
         SET position = position + 1
@@ -496,7 +504,8 @@ TABLE playlist_tracks:
   - track_id TEXT (references tracks.id)
   - position INTEGER (1-indexed position in playlist)
   - added_at TEXT (ISO timestamp)
-  - PRIMARY KEY (playlist_id, track_id)
+  - PRIMARY KEY (playlist_id, position)
+  - NOTE: Same track can appear multiple times in a playlist (duplicates allowed)
 
 USEFUL QUERIES:
 - Get all tracks in a playlist: SELECT t.* FROM tracks t JOIN playlist_tracks pt ON t.id = pt.track_id WHERE pt.playlist_id = '...' ORDER BY pt.position
