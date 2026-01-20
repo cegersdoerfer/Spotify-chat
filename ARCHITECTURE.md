@@ -2,15 +2,15 @@
 
 ## Overview
 
-SpotifyFS is a CLI tool that synchronizes Spotify playlists with a local filesystem, enabling version-controlled playlist management with Git integration and AI-powered playlist creation.
+SpotifyFS is a CLI tool that synchronizes Spotify playlists with a local SQLite database, enabling version-controlled playlist management with Git integration and AI-powered playlist creation.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                              SpotifyFS                                       │
 │                                                                              │
 │  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐  │
-│  │   Spotify   │◄──►│    Sync     │◄──►│ Filesystem  │◄──►│     Git     │  │
-│  │     API     │    │   Engine    │    │    Layer    │    │   Manager   │  │
+│  │   Spotify   │◄──►│    Sync     │◄──►│   SQLite    │◄──►│     Git     │  │
+│  │     API     │    │   Engine    │    │  + Markdown │    │   Manager   │  │
 │  └─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘  │
 │         ▲                  ▲                  ▲                  ▲          │
 │         │                  │                  │                  │          │
@@ -64,7 +64,8 @@ User Input
 │  - Config       │
 │  - StateStore   │
 │  - SpotifyClient│
-│  - Serializer   │
+│  - LibraryDB    │
+│  - Markdown Gen │
 │  - SyncEngine   │
 │  - GitManager   │
 └────────┬────────┘
@@ -149,14 +150,13 @@ Handles all communication with the Spotify Web API.
     │◄───────────────────────────────────────│                              │
 ```
 
-### 3. State Store (`src/state/`)
+### 3. Storage Layer (`src/state/`)
 
-SQLite database for persisting sync state and mappings.
+Two SQLite databases for state management and library storage.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        SQLite Database                           │
-│                        (state.db)                                │
+│                    State Database (state.db)                     │
 │                                                                  │
 │  ┌────────────────────────────────────────────────────────────┐ │
 │  │                   playlist_mappings                         │ │
@@ -187,11 +187,66 @@ SQLite database for persisting sync state and mappings.
 │  │  └─────────────┴───────────┴─────────────┘                 │ │
 │  └────────────────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│                  Library Database (library.db)                   │
+│              (Source of truth for playlist data)                │
+│                                                                  │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │                      playlists                              │ │
+│  │  ┌────┬──────┬─────────────┬───────────┬─────────────────┐ │ │
+│  │  │ id │ name │ description │ owner_id  │ last_synced_at  │ │ │
+│  │  │(PK)│      │             │           │                 │ │ │
+│  │  └────┴──────┴─────────────┴───────────┴─────────────────┘ │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                                                                  │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │                       tracks                                │ │
+│  │  ┌────┬──────┬─────────┬───────┬─────────────┬───────────┐ │ │
+│  │  │ id │ name │ artists │ album │ duration_ms │    uri    │ │ │
+│  │  │(PK)│      │ (JSON)  │       │             │           │ │ │
+│  │  └────┴──────┴─────────┴───────┴─────────────┴───────────┘ │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                                                                  │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │                   playlist_tracks                           │ │
+│  │  ┌─────────────┬──────────┬──────────┬──────────────────┐  │ │
+│  │  │ playlist_id │ track_id │ position │    added_at      │  │ │
+│  │  │    (PK)     │   (PK)   │          │                  │  │ │
+│  │  └─────────────┴──────────┴──────────┴──────────────────┘  │ │
+│  └────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### 4. Filesystem Layer (`src/filesystem/`)
+**SQL Operations for LLM:**
 
-Manages the local representation of playlists as folders and tracks as files.
+The chatbot can query and modify the library database using SQL:
+
+```sql
+-- Example queries the LLM can execute:
+
+-- Find all tracks by an artist
+SELECT * FROM tracks WHERE artists LIKE '%Taylor Swift%';
+
+-- Get tracks in a playlist ordered by position
+SELECT t.* FROM tracks t
+JOIN playlist_tracks pt ON t.id = pt.track_id
+WHERE pt.playlist_id = 'abc123'
+ORDER BY pt.position;
+
+-- Find duplicate tracks across playlists
+SELECT track_id, COUNT(*) as count
+FROM playlist_tracks
+GROUP BY track_id HAVING count > 1;
+
+-- Move tracks between playlists (via DELETE + INSERT)
+DELETE FROM playlist_tracks WHERE playlist_id = 'source' AND track_id = 'xyz';
+INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES ('dest', 'xyz', 1);
+```
+
+### 4. Markdown Layer (`src/filesystem/`)
+
+Generates human-readable markdown files from SQLite for meaningful Git diffs.
 
 **Workspace Structure:**
 
@@ -199,65 +254,50 @@ Manages the local representation of playlists as folders and tracks as files.
 SpotifyFS/
 │
 ├── .spotifyfs/
-│   ├── state.db              # SQLite database
+│   ├── state.db              # Sync state database
+│   ├── library.db            # Playlist/track data (source of truth)
 │   ├── config.json           # Workspace configuration
 │   ├── tokens.json           # Spotify OAuth tokens (secured)
-│   ├── logs/                 # Sync operation logs
 │   └── proposals/            # Chatbot proposal metadata
 │       └── <id>.json
 │
-├── Playlists/
-│   ├── My Playlist__<playlist_id>/
-│   │   ├── playlist.json     # Playlist metadata
-│   │   └── tracks/
-│   │       ├── 001__Artist - Song__<track_id>.spotify
-│   │       ├── 002__Artist - Song__<track_id>.spotify
-│   │       └── ...
-│   │
-│   └── Another Playlist__<playlist_id>/
-│       ├── playlist.json
-│       └── tracks/
-│           └── ...
+├── Playlists/                # Generated markdown (for Git diffs)
+│   ├── My Playlist.md
+│   ├── Another Playlist.md
+│   └── ...
 │
 ├── .git/                     # Git repository
 ├── .gitignore
 └── README.md
 ```
 
-**File Formats:**
+**Markdown Format:**
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  playlist.json                                                   │
-├─────────────────────────────────────────────────────────────────┤
-│  {                                                               │
-│    "id": "37i9dQZF1DX...",                                      │
-│    "uri": "spotify:playlist:37i9dQZF1DX...",                    │
-│    "name": "My Playlist",                                        │
-│    "description": "A great playlist",                            │
-│    "isPublic": false,                                            │
-│    "collaborative": false,                                       │
-│    "snapshotId": "MTY3...",                                      │
-│    "owner": { "id": "user123", "displayName": "User" },         │
-│    "lastSyncedAt": "2026-01-19T12:00:00Z"                       │
-│  }                                                               │
-└─────────────────────────────────────────────────────────────────┘
+```markdown
+# My Awesome Playlist
 
-┌─────────────────────────────────────────────────────────────────┐
-│  001__Artist - Track Name__4iV5W9uYEdYUVa79Axb7Rh.spotify       │
-├─────────────────────────────────────────────────────────────────┤
-│  spotify:track:4iV5W9uYEdYUVa79Axb7Rh                           │
-└─────────────────────────────────────────────────────────────────┘
-     │         │                    │                    │
-     │         │                    │                    └─ File extension
-     │         │                    └─ Track ID (source of truth)
-     │         └─ Display name (human-readable)
-     └─ Position (for ordering)
+**ID:** 37i9dQZF1DX...
+**Owner:** username
+**Tracks:** 42
+**Last Synced:** 2026-01-20
+
+## Tracks
+
+| # | Title | Artist | Album | Duration |
+|---|-------|--------|-------|----------|
+| 1 | Song Name | Artist Name | Album Name | 3:45 |
+| 2 | Another Song | Another Artist | Another Album | 4:12 |
+| ... | ... | ... | ... | ... |
 ```
+
+This format provides:
+- Human-readable playlist representation
+- Meaningful Git diffs when tracks are added/removed/reordered
+- Easy review of chatbot-proposed changes
 
 ### 5. Sync Engine (`src/sync/`)
 
-Handles bidirectional synchronization between local and Spotify.
+Handles bidirectional synchronization between SQLite and Spotify.
 
 **Sync Flow:**
 
@@ -269,8 +309,8 @@ Handles bidirectional synchronization between local and Spotify.
                     ┌──────────────┴──────────────┐
                     ▼                              ▼
             ┌───────────────┐              ┌───────────────┐
-            │  Fetch Remote │              │  Read Local   │
-            │   Playlists   │              │   Playlists   │
+            │  Fetch Remote │              │  Read SQLite  │
+            │   Playlists   │              │    Library    │
             └───────┬───────┘              └───────┬───────┘
                     │                              │
                     └──────────────┬───────────────┘
@@ -300,10 +340,9 @@ Handles bidirectional synchronization between local and Spotify.
                                   │
                                   ▼
                          ┌─────────────────┐
-                         │  Update State   │
-                         │  • Mappings     │
-                         │  • Snapshots    │
-                         │  • Sync Log     │
+                         │ Update SQLite   │
+                         │ Generate Markdown│
+                         │ Update State    │
                          └────────┬────────┘
                                   │
                                   ▼
@@ -313,34 +352,19 @@ Handles bidirectional synchronization between local and Spotify.
                          └─────────────────┘
 ```
 
-**Diff Computation:**
+**Pull Operation:**
+1. Fetch all playlists from Spotify API
+2. Import each playlist into SQLite (`library.db`)
+3. Generate markdown files from SQLite
+4. Update state mappings in `state.db`
+5. Git commit the markdown changes
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                      Playlist Diff                               │
-│                                                                  │
-│   Local Tracks: [A, B, C, D, E]     Remote Tracks: [A, B, F, G] │
-│                                                                  │
-│   ┌─────────────────────────────────────────────────────────┐   │
-│   │                    Comparison                            │   │
-│   │                                                          │   │
-│   │   Common:    [A, B]     (in both)                       │   │
-│   │   Additions: [C, D, E]  (local only → add to Spotify)   │   │
-│   │   Removals:  [F, G]     (remote only → remove locally)  │   │
-│   │   Reorder:   Check if common tracks are in same order   │   │
-│   │                                                          │   │
-│   └─────────────────────────────────────────────────────────┘   │
-│                                                                  │
-│   ┌─────────────────────────────────────────────────────────┐   │
-│   │                  Conflict Detection                      │   │
-│   │                                                          │   │
-│   │   Conflict occurs when:                                  │   │
-│   │   • Remote snapshot changed since last sync              │   │
-│   │   • AND local track hash changed since last sync         │   │
-│   │                                                          │   │
-│   └─────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
-```
+**Push Operation:**
+1. Read playlists from SQLite
+2. Compare with remote Spotify state
+3. Apply changes to Spotify API
+4. Update SQLite with new snapshot IDs
+5. Regenerate markdown files
 
 ### 6. Git Manager (`src/git/`)
 
@@ -366,35 +390,9 @@ Integrates with Git for version control.
            Push to Spotify
 ```
 
-**Commit Workflow:**
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Git Operations                            │
-│                                                                  │
-│   Pull from Spotify:                                             │
-│   ┌─────────────┐    ┌─────────────┐    ┌─────────────┐        │
-│   │ Fetch remote│───►│Write to disk│───►│ Auto-commit │        │
-│   │  playlists  │    │   files     │    │  changes    │        │
-│   └─────────────┘    └─────────────┘    └─────────────┘        │
-│                                                                  │
-│   Push to Spotify:                                               │
-│   ┌─────────────┐    ┌─────────────┐    ┌─────────────┐        │
-│   │Check working│───►│   Compute   │───►│   Apply to  │        │
-│   │ tree clean  │    │    diff     │    │   Spotify   │        │
-│   └─────────────┘    └─────────────┘    └─────────────┘        │
-│                                                                  │
-│   Chatbot Proposal:                                              │
-│   ┌─────────────┐    ┌─────────────┐    ┌─────────────┐        │
-│   │Create branch│───►│Make changes │───►│Commit with  │        │
-│   │  bot/...    │    │  locally    │    │  metadata   │        │
-│   └─────────────┘    └─────────────┘    └─────────────┘        │
-└─────────────────────────────────────────────────────────────────┘
-```
-
 ### 7. Chatbot Orchestrator (`src/chatbot/`)
 
-AI-powered playlist management using GPT-5.
+AI-powered playlist management using GPT-5 with SQL capabilities.
 
 **Architecture:**
 
@@ -404,60 +402,52 @@ AI-powered playlist management using GPT-5.
 │                                                                  │
 │  ┌───────────────────────────────────────────────────────────┐  │
 │  │                      User Prompt                           │  │
-│  │         "Create a chill bossa nova playlist"              │  │
+│  │      "Move all jazz tracks to my Jazz Favorites playlist" │  │
+│  └─────────────────────────┬─────────────────────────────────┘  │
+│                            │                                     │
+│                            ▼                                     │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │                Library Context Builder                     │  │
+│  │                                                            │  │
+│  │  • Database schema documentation                           │  │
+│  │  • Library stats (playlists, tracks, etc.)                │  │
+│  │  • Playlist summary table                                  │  │
 │  └─────────────────────────┬─────────────────────────────────┘  │
 │                            │                                     │
 │                            ▼                                     │
 │  ┌───────────────────────────────────────────────────────────┐  │
 │  │                   Planner (GPT-5)                          │  │
 │  │                                                            │  │
-│  │  ┌─────────────────────────────────────────────────────┐  │  │
-│  │  │                  System Prompt                       │  │  │
-│  │  │  • Available step types                              │  │  │
-│  │  │  • Planning guidelines                               │  │  │
-│  │  │  • Existing playlists context                        │  │  │
-│  │  └─────────────────────────────────────────────────────┘  │  │
-│  │                          │                                 │  │
-│  │                          ▼                                 │  │
-│  │  ┌─────────────────────────────────────────────────────┐  │  │
-│  │  │              JSON Structured Output                  │  │  │
-│  │  │  {                                                   │  │  │
-│  │  │    "plan": { "intent": "...", "steps": [...] },     │  │  │
-│  │  │    "confidence": 0.95,                               │  │  │
-│  │  │    "interpretation": "..."                           │  │  │
-│  │  │  }                                                   │  │  │
-│  │  └─────────────────────────────────────────────────────┘  │  │
+│  │  Input:                                                    │  │
+│  │  • User prompt                                             │  │
+│  │  • Database schema                                         │  │
+│  │  • Available step types (including SQL)                    │  │
+│  │  • Current library state                                   │  │
+│  │                                                            │  │
+│  │  Output (JSON):                                            │  │
+│  │  {                                                         │  │
+│  │    "plan": {                                               │  │
+│  │      "intent": "Move jazz tracks",                         │  │
+│  │      "steps": [                                            │  │
+│  │        { "type": "sql_query", "query": "SELECT..." },     │  │
+│  │        { "type": "move_tracks", ... },                    │  │
+│  │        { "type": "generate_markdown" },                   │  │
+│  │        { "type": "commit_changes", ... }                  │  │
+│  │      ]                                                     │  │
+│  │    },                                                      │  │
+│  │    "confidence": 0.92                                      │  │
+│  │  }                                                         │  │
 │  └─────────────────────────┬─────────────────────────────────┘  │
 │                            │                                     │
 │                            ▼                                     │
 │  ┌───────────────────────────────────────────────────────────┐  │
 │  │                 Executor (Deterministic)                   │  │
 │  │                                                            │  │
-│  │  Step 1: create_branch "bossa-nova-mix"                   │  │
-│  │       │                                                    │  │
-│  │       ▼                                                    │  │
-│  │  Step 2: fetch_saved_tracks (limit: 500)                  │  │
-│  │       │                                                    │  │
-│  │       ▼                                                    │  │
-│  │  Step 3: search_tracks "bossa nova" (limit: 100)          │  │
-│  │       │                                                    │  │
-│  │       ▼                                                    │  │
-│  │  Step 4: filter_tracks (keywords: ["bossa", "brazilian"]) │  │
-│  │       │                                                    │  │
-│  │       ▼                                                    │  │
-│  │  Step 5: create_playlist "Bossa Nova Mix"                 │  │
-│  │       │                                                    │  │
-│  │       ▼                                                    │  │
-│  │  Step 6: commit_changes "Create playlist: Bossa Nova Mix" │  │
-│  │                                                            │  │
-│  └───────────────────────────────────────────────────────────┘  │
-│                            │                                     │
-│                            ▼                                     │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │                        Result                              │  │
-│  │  • Branch: bot/bossa-nova-mix-2026-01-19                  │  │
-│  │  • Changes: 1 playlist created, 47 tracks added           │  │
-│  │  • Status: Ready for review                                │  │
+│  │  Executes plan steps against:                              │  │
+│  │  • SQLite database (query/execute)                         │  │
+│  │  • Spotify API (search, fetch)                             │  │
+│  │  • Git (branch, commit)                                    │  │
+│  │  • Markdown generator                                      │  │
 │  └───────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -468,16 +458,38 @@ AI-powered playlist management using GPT-5.
 ┌─────────────────────────────────────────────────────────────────┐
 │                     Plan Step Types                              │
 ├─────────────────┬───────────────────────────────────────────────┤
+│  SQL Operations                                                  │
+├─────────────────┼───────────────────────────────────────────────┤
+│ sql_query       │ Execute SELECT query on library database      │
+│ sql_execute     │ Execute INSERT/UPDATE/DELETE on library DB    │
+├─────────────────┼───────────────────────────────────────────────┤
+│  Spotify API Operations                                          │
+├─────────────────┼───────────────────────────────────────────────┤
 │ search_tracks   │ Search Spotify for tracks by query            │
-│ list_playlists  │ Get all user playlists (read-only)            │
+│ list_playlists  │ Get all user playlists from Spotify           │
 │ fetch_playlist  │ Get tracks from a specific playlist           │
 │ fetch_saved     │ Get user's liked/saved tracks                 │
 │ filter_tracks   │ Filter collected tracks by criteria           │
-│ create_playlist │ Create a new playlist locally                 │
+├─────────────────┼───────────────────────────────────────────────┤
+│  Playlist Operations                                             │
+├─────────────────┼───────────────────────────────────────────────┤
+│ create_playlist │ Create a new playlist in database             │
+│ delete_playlist │ Delete a playlist from database               │
+│ rename_playlist │ Rename a playlist                             │
 │ add_tracks      │ Add tracks to existing playlist               │
 │ remove_tracks   │ Remove tracks from playlist                   │
+│ move_tracks     │ Move tracks between playlists                 │
+│ reorder_tracks  │ Reorder tracks within a playlist              │
+├─────────────────┼───────────────────────────────────────────────┤
+│  Git Operations                                                  │
+├─────────────────┼───────────────────────────────────────────────┤
 │ create_branch   │ Create Git branch for changes                 │
 │ commit_changes  │ Commit changes to Git                         │
+├─────────────────┼───────────────────────────────────────────────┤
+│  Sync Operations                                                 │
+├─────────────────┼───────────────────────────────────────────────┤
+│ sync_to_spotify │ Push local changes to Spotify                 │
+│ generate_markdown│ Regenerate markdown from database            │
 └─────────────────┴───────────────────────────────────────────────┘
 ```
 
@@ -487,8 +499,8 @@ AI-powered playlist management using GPT-5.
 
 ```
 ┌─────────┐         ┌─────────┐         ┌─────────┐         ┌─────────┐
-│ Spotify │         │  Sync   │         │Filesys- │         │  State  │
-│   API   │         │ Engine  │         │  tem    │         │  Store  │
+│ Spotify │         │  Sync   │         │ SQLite  │         │Markdown │
+│   API   │         │ Engine  │         │ Library │         │Generator│
 └────┬────┘         └────┬────┘         └────┬────┘         └────┬────┘
      │                   │                   │                   │
      │ ◄─── Get all ─────│                   │                   │
@@ -501,23 +513,13 @@ AI-powered playlist management using GPT-5.
      │                   │                   │                   │
      │ ──── Tracks ─────►│                   │                   │
      │                   │                   │                   │
-     │                   │ ── Read local ───►│                   │
+     │                   │ ── Import ───────►│                   │
      │                   │    playlists      │                   │
      │                   │                   │                   │
-     │                   │ ◄─ Local data ────│                   │
+     │                   │ ── Generate ──────────────────────────►
+     │                   │    markdown       │                   │
      │                   │                   │                   │
-     │                   │ ─── Get last ─────────────────────────►
-     │                   │     sync state    │                   │
-     │                   │                   │                   │
-     │                   │ ◄── State data ───────────────────────│
-     │                   │                   │                   │
-     │                   │ [Compute diff]    │                   │
-     │                   │                   │                   │
-     │                   │ ── Write new ────►│                   │
-     │                   │    playlists      │                   │
-     │                   │                   │                   │
-     │                   │ ── Update ────────────────────────────►
-     │                   │    mappings       │                   │
+     │                   │                   │ ─── .md files ───►│
      │                   │                   │                   │
 ```
 
@@ -525,34 +527,30 @@ AI-powered playlist management using GPT-5.
 
 ```
 ┌─────────┐         ┌─────────┐         ┌─────────┐         ┌─────────┐
-│Filesys- │         │  Sync   │         │ Spotify │         │  State  │
-│  tem    │         │ Engine  │         │   API   │         │  Store  │
+│ SQLite  │         │  Sync   │         │ Spotify │         │Markdown │
+│ Library │         │ Engine  │         │   API   │         │Generator│
 └────┬────┘         └────┬────┘         └────┬────┘         └────┬────┘
      │                   │                   │                   │
      │ ◄── Read local ───│                   │                   │
      │     playlists     │                   │                   │
      │                   │                   │                   │
-     │ ── Local data ───►│                   │                   │
+     │ ── Playlist data ►│                   │                   │
      │                   │                   │                   │
      │                   │ ── Get remote ───►│                   │
      │                   │    playlists      │                   │
      │                   │                   │                   │
      │                   │ ◄─ Remote data ───│                   │
      │                   │                   │                   │
-     │                   │ ◄── Get sync ─────────────────────────│
-     │                   │     context       │                   │
-     │                   │                   │                   │
      │                   │ [Compute diff]    │                   │
-     │                   │ [Check conflicts] │                   │
      │                   │                   │                   │
-     │                   │ ── Add tracks ───►│                   │
+     │                   │ ── Create/Update ►│                   │
+     │                   │    playlists      │                   │
      │                   │                   │                   │
-     │                   │ ── Remove trks ──►│                   │
+     │ ◄─── Update ──────│                   │                   │
+     │      snapshots    │                   │                   │
      │                   │                   │                   │
-     │                   │ ── Reorder ──────►│                   │
-     │                   │                   │                   │
-     │                   │ ── Update ────────────────────────────►
-     │                   │    state          │                   │
+     │                   │ ── Regenerate ────────────────────────►
+     │                   │    markdown       │                   │
      │                   │                   │                   │
 ```
 
@@ -560,11 +558,17 @@ AI-powered playlist management using GPT-5.
 
 ```
 ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐
-│  User   │    │Orchestr-│    │ Planner │    │Executor │    │  Git    │
-│         │    │  ator   │    │ (GPT-5) │    │         │    │ Manager │
+│  User   │    │Orchestr-│    │ Planner │    │Executor │    │ SQLite  │
+│         │    │  ator   │    │ (GPT-5) │    │         │    │ Library │
 └────┬────┘    └────┬────┘    └────┬────┘    └────┬────┘    └────┬────┘
      │              │              │              │              │
      │ ─ Prompt ───►│              │              │              │
+     │              │              │              │              │
+     │              │ ─ Build ─────────────────────────────────►│
+     │              │   context    │              │              │
+     │              │              │              │              │
+     │              │ ◄─ Schema + ─────────────────────────────│
+     │              │   stats      │              │              │
      │              │              │              │              │
      │              │ ─ Generate ─►│              │              │
      │              │    plan      │              │              │
@@ -572,20 +576,16 @@ AI-powered playlist management using GPT-5.
      │              │              │ [Call GPT-5] │              │
      │              │              │              │              │
      │              │ ◄─ Plan ─────│              │              │
-     │              │    + conf.   │              │              │
      │              │              │              │              │
      │              │ ─ Execute ──────────────────►              │
      │              │    steps     │              │              │
      │              │              │              │              │
-     │              │              │              │ ─ Create ────►
-     │              │              │              │   branch     │
+     │              │              │              │ ─ SQL query ►│
      │              │              │              │              │
-     │              │              │              │ [Fetch tracks]
-     │              │              │              │ [Filter]     │
-     │              │              │              │ [Create playlist]
+     │              │              │              │ ◄─ Results ──│
      │              │              │              │              │
-     │              │              │              │ ─ Commit ────►
-     │              │              │              │   changes    │
+     │              │              │              │ ─ SQL exec ─►│
+     │              │              │              │   (modify)   │
      │              │              │              │              │
      │              │ ◄─ Result ───────────────────              │
      │              │              │              │              │
@@ -602,18 +602,19 @@ AI-powered playlist management using GPT-5.
 SpotifyTrack       { id, uri, name, artists[], album, durationMs }
 SpotifyPlaylist    { id, uri, name, description, isPublic, snapshotId, owner }
 
-// Local representation
-LocalTrackRef      { trackId, uri, displayName, position, filePath }
-LocalPlaylist      { playlistId, name, folderPath, tracks[], metadata }
+// Database types
+DbPlaylist         { id, name, description, track_count, last_synced_at, ... }
+DbTrack            { id, name, artists (JSON), album, duration_ms, uri }
+DbPlaylistTrack    { playlist_id, track_id, position, added_at }
 
 // Sync types
 PlaylistDiff       { additions[], removals[], reorderNeeded, hasConflict }
 SyncOperation      { type, playlistId?, trackIds?, ... }
-SyncPlan           { operations[], conflicts[] }
 SyncResult         { success, appliedOperations[], failedOperations[] }
 
 // Chatbot types
-PlanStep           { type, ...params }
+PlanStep           { type: 'sql_query' | 'sql_execute' | 'create_playlist' | ... }
+LibraryContext     { schema, stats, playlistSummary }
 ChatbotPlan        { intent, steps[], estimatedChanges }
 ProposalMetadata   { id, branchName, userPrompt, summary, changes }
 ```
@@ -635,15 +636,22 @@ ProposalMetadata   { id, branchName, userPrompt, summary, changes }
 │  ┌─────────────────────────────────────────────────────────┐    │
 │  │                   Sync Conflicts                         │    │
 │  │  • Detect via snapshot comparison                        │    │
-│  │  • Options: take-local, take-remote, interactive         │    │
+│  │  • Options: take-local, take-remote, abort               │    │
 │  │  • Create conflict branch for manual resolution          │    │
 │  └─────────────────────────────────────────────────────────┘    │
 │                                                                  │
 │  ┌─────────────────────────────────────────────────────────┐    │
+│  │                   SQL Safety                             │    │
+│  │  • query() only allows SELECT                            │    │
+│  │  • execute() only allows INSERT/UPDATE/DELETE            │    │
+│  │  • DROP, ALTER, TRUNCATE are blocked                     │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐    │
 │  │                   LLM Failures                           │    │
-│  │  • Fallback to simple rule-based plan                    │    │
-│  │  • Return low confidence score                           │    │
-│  │  • Log error for debugging                               │    │
+│  │  • Low confidence → Return helpful error message         │    │
+│  │  • API failure → Log and return error                    │    │
+│  │  • Invalid plan → Validation before execution            │    │
 │  └─────────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -659,7 +667,6 @@ ProposalMetadata   { id, branchName, userPrompt, summary, changes }
   "settings": {
     "pullInterval": 300000,      // Remote polling interval (ms)
     "autoCommit": true,          // Auto-commit after sync
-    "orderingMode": "prefix",    // "prefix" or "orderfile"
     "syncLibrary": false,        // Sync liked tracks
     "conflictPolicy": "prompt"   // "prompt", "take-local", "take-remote"
   }
@@ -676,6 +683,7 @@ ProposalMetadata   { id, branchName, userPrompt, summary, changes }
 │  • Tokens file excluded from Git via .gitignore                  │
 │  • PKCE flow prevents authorization code interception            │
 │  • API keys read from environment variables                      │
+│  • SQL operations sanitized (no DROP/ALTER/TRUNCATE)             │
 │  • No audio data downloaded or stored                            │
 │  • Only playlist/track metadata synced                           │
 └─────────────────────────────────────────────────────────────────┘
